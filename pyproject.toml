@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repoprompt"
+version = "1.2.0"
+authors = [
+  { name="liveeeeee", email="liveeeeee@github.com" },
+]
+description = "Pure Python, Zero-Dependency Codebase Packager for LLMs. Pack whole repos into clean prompts in milliseconds."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["llm", "repopack", "repomix", "prompt", "codebase", "context", "ai", "claude", "chatgpt"]
+
+[project.urls]
+"Homepage" = "https://github.com/liveeeeee/repoprompt"
+"Bug Tracker" = "https://github.com/liveeeeee/repoprompt/issues"
+"Funding" = "https://paypal.me/liveeeeee1203"
+
+[project.scripts]
+repoprompt = "repoprompt:main"

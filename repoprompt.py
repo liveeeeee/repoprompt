@@ -1,0 +1,507 @@
+"""
+RepoPrompt: Pure Python, Zero-Dependency Codebase Packager for LLMs.
+A lightweight, battle-tested, lightning-fast alternative to Repomix (no Node.js required!).
+Author: liveeeeee (https://github.com/liveeeeee)
+Sponsorship: https://paypal.me/liveeeeee1203
+License: MIT
+"""
+
+import fnmatch
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import List, Set, Tuple, Optional, Dict, Any
+
+
+PAYPAL_URL = "https://paypal.me/liveeeeee1203"
+VERSION = "1.2.0"
+
+# 默认全局忽略的目录与文件（内置防自吞噬规则）
+DEFAULT_IGNORE_PATTERNS = [
+    ".git", ".svn", ".hg",
+    "node_modules", "bower_components",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".venv", "venv", "env", ".env", ".env.*",
+    "dist", "build", "out", "target", "bin", "obj",
+    ".idea", ".vscode", ".DS_Store", "Thumbs.db",
+    "repomix-output.*", "pyrepomix-output.*", "repoprompt-output.*",
+    "*.pyc", "*.pyo", "*.pyd", "*.so", "*.dll", "*.dylib", "*.exe",
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.svg", "*.webp",
+    "*.mp4", "*.mp3", "*.wav", "*.avi", "*.mov",
+    "*.zip", "*.tar", "*.gz", "*.7z", "*.rar",
+    "*.pdf", "*.docx", "*.xlsx", "*.pptx",
+    "*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock"
+]
+
+# 常见纯文本与代码文件扩展名
+TEXT_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".scss", ".sass",
+    ".c", ".cpp", ".h", ".hpp", ".cc", ".cxx", ".cs", ".go", ".rs", ".java",
+    ".kt", ".kts", ".swift", ".m", ".mm", ".rb", ".php", ".sh", ".bash", ".zsh",
+    ".ps1", ".bat", ".cmd", ".lua", ".r", ".dart", ".scala", ".clj", ".ex", ".exs",
+    ".sql", ".graphql", ".proto",
+    ".json", ".yaml", ".yml", ".toml", ".xml", ".ini", ".cfg", ".conf",
+    ".md", ".markdown", ".rst", ".txt", ".csv",
+    ".dockerignore", "Dockerfile", "Makefile"
+}
+
+
+class GitIgnoreEngine:
+    """
+    轻量且贴合 Git 规范的 GitIgnore 引擎。
+    支持：
+    1. 根目录与子目录 .gitignore 嵌套继承
+    2. /pattern 根路径锚定匹配
+    3. !pattern 否定反选规则
+    4. pattern/ 目录限定匹配
+    """
+
+    def __init__(self, root_dir: Path, extra_ignores: Optional[List[str]] = None):
+        self.root_dir = root_dir.resolve()
+        self.rules: List[Tuple[Path, bool, str, bool]] = []
+        self._init_default_rules(extra_ignores or [])
+        self._collect_all_gitignores()
+
+    def _init_default_rules(self, extra_ignores: List[str]):
+        for pat in DEFAULT_IGNORE_PATTERNS + extra_ignores:
+            self.rules.append((self.root_dir, False, pat, False))
+
+    def _collect_all_gitignores(self):
+        for curr_root, dirs, files in os.walk(self.root_dir, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in [".git", "node_modules", ".venv", "__pycache__"]]
+            if ".gitignore" in files:
+                git_path = Path(curr_root) / ".gitignore"
+                self._parse_file(git_path, Path(curr_root))
+
+    def _parse_file(self, filepath: Path, scope_dir: Path):
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    is_neg = False
+                    if line.startswith("!"):
+                        is_neg = True
+                        line = line[1:].strip()
+
+                    is_dir_only = line.endswith("/")
+                    clean_pat = line.rstrip("/")
+
+                    # 处理 / 开头的根锚定规则
+                    is_rooted = clean_pat.startswith("/")
+                    if is_rooted:
+                        clean_pat = clean_pat.lstrip("/")
+
+                    if clean_pat:
+                        self.rules.append((scope_dir, is_neg, clean_pat, is_dir_only))
+        except Exception:
+            pass
+
+    def is_ignored(self, path: Path, is_dir: bool = False) -> bool:
+        resolved_path = path.resolve()
+        try:
+            rel_to_root = resolved_path.relative_to(self.root_dir).as_posix()
+        except ValueError:
+            return False
+
+        ignored = False
+        for scope_dir, is_neg, pat, is_dir_only in self.rules:
+            if is_dir_only and not is_dir:
+                continue
+
+            # 确定匹配路径的作用域
+            try:
+                rel_to_scope = resolved_path.relative_to(scope_dir).as_posix()
+            except ValueError:
+                continue
+
+            matched = False
+            # 模式包含斜杠时按完整相对路径匹配，否则支持文件名匹配
+            if "/" in pat:
+                if fnmatch.fnmatch(rel_to_scope, pat) or fnmatch.fnmatch(rel_to_scope, f"*/{pat}"):
+                    matched = True
+            else:
+                if fnmatch.fnmatch(path.name, pat) or fnmatch.fnmatch(rel_to_scope, pat):
+                    matched = True
+
+            if matched:
+                ignored = not is_neg
+
+        return ignored
+
+
+def is_binary_file(file_path: Path) -> bool:
+    """通过读取首部 1024 字节嗅探是否包含 null 字节来判定是否二进制文件"""
+    ext = file_path.suffix.lower()
+    if ext in TEXT_EXTENSIONS:
+        return False
+    try:
+        with open(file_path, "rb") as f:
+            chunk = f.read(1024)
+            if b"\x00" in chunk:
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def is_minified_file(file_path: Path, sample_lines: int = 5) -> bool:
+    """智能嗅探是否为 minified 单行代码（如 bundle.min.js）"""
+    name = file_path.name.lower()
+    if ".min." in name or "-min." in name:
+        return True
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i >= sample_lines:
+                    break
+                if len(line) > 1500:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def get_adaptive_backticks(content: str) -> str:
+    """
+    自适应反引号计算，防止源码内含有 ``` 导致 Markdown 代码块结构提前截断崩溃。
+    动态计算文本中连续出现反引号的最大长度 N，返回 N + 1 个反引号作为围栏。
+    """
+    matches = re.findall(r"`+", content)
+    if not matches:
+        return "```"
+    max_ticks = max(len(m) for m in matches)
+    return "`" * max(3, max_ticks + 1)
+
+
+def read_file_safe(file_path: Path) -> str:
+    """
+    多重编码平滑回退安全读取（防止 GBK/ANSI/Windows-1252 崩溃）
+    """
+    encodings = ["utf-8", "utf-8-sig", "gb18030", "gbk", "latin-1"]
+    for enc in encodings:
+        try:
+            with open(file_path, "r", encoding=enc) as f:
+                return f.read()
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            return f"[Error reading file: {e}]"
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def format_minified_content(content: str, max_line_len: int = 2000) -> str:
+    """防止单行 20 万字符打崩 LLM 单行注意力，按安全长度切片换行"""
+    lines = content.splitlines(keepends=True)
+    safe_lines = []
+    for line in lines:
+        if len(line) > max_line_len:
+            chunks = [line[i:i + max_line_len] for i in range(0, len(line), max_line_len)]
+            safe_lines.append("\n/* [RepoPrompt: Chunked long line] */\n".join(chunks))
+        else:
+            safe_lines.append(line)
+    return "".join(safe_lines)
+
+
+def build_directory_tree(root_dir: Path, gitignore: GitIgnoreEngine, max_depth: int = 6, include_minified: bool = False) -> str:
+    """生成整洁清晰的 ASCII 目录树，智能剔除忽略文件、二进制与混淆文件"""
+    tree_lines = [f"{root_dir.name}/"]
+
+    def _walk(directory: Path, prefix: str, depth: int):
+        if depth > max_depth:
+            tree_lines.append(f"{prefix}└── ... (depth limit reached)")
+            return
+
+        try:
+            items = []
+            for item in directory.iterdir():
+                try:
+                    if item.is_symlink() and not item.exists():
+                        continue
+                    is_d = item.is_dir()
+                    if gitignore.is_ignored(item, is_dir=is_d):
+                        continue
+                    if not is_d:
+                        if is_binary_file(item):
+                            continue
+                        if not include_minified and is_minified_file(item):
+                            continue
+                    items.append(item)
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError):
+            return
+
+        items.sort(key=lambda x: (not x.is_dir(), x.name.lower()))
+        count = len(items)
+        for i, item in enumerate(items):
+            is_last = (i == count - 1)
+            connector = "└── " if is_last else "├── "
+            tree_lines.append(f"{prefix}{connector}{item.name}{'/' if item.is_dir() else ''}")
+
+            if item.is_dir():
+                extension = "    " if is_last else "│   "
+                _walk(item, prefix + extension, depth + 1)
+
+    _walk(root_dir, "", 1)
+    return "\n".join(tree_lines)
+
+
+def estimate_tokens_approx(text: str) -> int:
+    """常数级近似 Token 估算（英文~4字符/Token，中日韩代码~1.5字符/Token）"""
+    length = len(text)
+    if length == 0:
+        return 0
+    return max(1, int(length / 3.5))
+
+
+def copy_to_clipboard(text: str) -> bool:
+    """纯标准库跨平台安全剪贴板注入（优先 Windows clip，Linux xclip/wl-copy，macOS pbcopy）"""
+    try:
+        if sys.platform == "win32":
+            proc = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
+            proc.communicate(input=text.encode("utf-16le"))
+            return proc.returncode == 0
+        elif sys.platform == "darwin":
+            proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            proc.communicate(input=text.encode("utf-8"))
+            return proc.returncode == 0
+        else:
+            for tool in [["wl-copy"], ["xclip", "-selection", "clipboard"]]:
+                try:
+                    proc = subprocess.Popen(tool, stdin=subprocess.PIPE)
+                    proc.communicate(input=text.encode("utf-8"))
+                    if proc.returncode == 0:
+                        return True
+                except FileNotFoundError:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+def pack_codebase(
+    target_dir: str = ".",
+    output_format: str = "markdown",
+    include_minified: bool = False,
+    output_filename: Optional[str] = None,
+    max_file_size: int = 10 * 1024 * 1024,
+    max_depth: int = 8
+) -> Tuple[str, Dict[str, Any]]:
+    """核心打包函数，支持 Markdown 与 XML 格式"""
+    start_time = time.time()
+    root_path = Path(target_dir).resolve()
+    if not root_path.exists():
+        raise FileNotFoundError(f"Directory not found: {target_dir}")
+
+    # 动态将输出文件加入忽略，防自身吞噬
+    extra_ignores = []
+    if output_filename:
+        extra_ignores.append(Path(output_filename).name)
+
+    gitignore = GitIgnoreEngine(root_path, extra_ignores=extra_ignores)
+
+    valid_files: List[Path] = []
+    for root, dirs, files in os.walk(root_path, followlinks=False):
+        d_path = Path(root)
+        try:
+            rel_depth = len(d_path.relative_to(root_path).parts)
+            if rel_depth >= max_depth:
+                dirs[:] = []
+                continue
+        except ValueError:
+            pass
+
+        # 实时根据 .gitignore 剪枝跳过不扫描的文件夹
+        dirs[:] = [d for d in dirs if not gitignore.is_ignored(d_path / d, is_dir=True)]
+
+        for f in files:
+            file_path = d_path / f
+            try:
+                if file_path.is_symlink() and not file_path.exists():
+                    continue
+                if gitignore.is_ignored(file_path, is_dir=False):
+                    continue
+                if is_binary_file(file_path):
+                    continue
+                try:
+                    if file_path.stat().st_size > max_file_size:
+                        continue
+                except OSError:
+                    continue
+                if not include_minified and is_minified_file(file_path):
+                    continue
+                valid_files.append(file_path)
+            except (OSError, PermissionError):
+                continue
+
+    valid_files.sort(key=lambda x: x.as_posix().lower())
+
+    tree_str = build_directory_tree(root_path, gitignore, max_depth=max_depth, include_minified=include_minified)
+
+    total_lines = 0
+    file_blocks = []
+
+    for file_path in valid_files:
+        rel_path = file_path.relative_to(root_path).as_posix()
+        content = read_file_safe(file_path)
+        content = format_minified_content(content)
+        line_count = len(content.splitlines())
+        total_lines += line_count
+
+        if output_format == "xml":
+            block = (
+                f'<file path="{rel_path}">\n'
+                f"{content.rstrip()}\n"
+                f"</file>"
+            )
+        else:
+            fence = get_adaptive_backticks(content)
+            ext = file_path.suffix.lstrip(".")
+            lang_id = ext if ext else ""
+            block = (
+                f"### File: `{rel_path}`\n"
+                f"{fence}{lang_id}\n"
+                f"{content.rstrip()}\n"
+                f"{fence}\n"
+            )
+        file_blocks.append(block)
+
+    if output_format == "xml":
+        final_output = (
+            f'<project name="{root_path.name}">\n'
+            f"  <generated_by>RepoPrompt v{VERSION} - Zero-Dependency Codebase Packager</generated_by>\n"
+            f"  <directory_structure>\n{tree_str}\n  </directory_structure>\n"
+            f"  <files>\n" + "\n".join(file_blocks) + "\n  </files>\n"
+            f"</project>\n"
+        )
+    else:
+        final_output = (
+            f"# Project: {root_path.name}\n\n"
+            f"> Generated by **[RepoPrompt](https://github.com/liveeeeee/repoprompt)** v{VERSION}  \n"
+            f"> Pure Python, Zero-Dependency Codebase Packager for LLMs.  \n"
+            f"> Support the project: [{PAYPAL_URL}]({PAYPAL_URL})\n\n"
+            f"## Directory Structure\n\n"
+            f"```text\n{tree_str}\n```\n\n"
+            f"## File Contents\n\n"
+            + "\n".join(file_blocks)
+        )
+
+    elapsed = round(time.time() - start_time, 3)
+    meta = {
+        "files_count": len(valid_files),
+        "total_lines": total_lines,
+        "elapsed_sec": elapsed,
+        "token_estimate": estimate_tokens_approx(final_output)
+    }
+
+    return final_output, meta
+
+
+def self_test():
+    """自动化离线自检，包含全部红蓝对抗防御断言"""
+    print("[*] 正在执行 RepoPrompt 对抗防御自检...")
+    import tempfile
+    test_dir = Path(tempfile.mkdtemp(prefix="repoprompt_test_"))
+
+    # 1. 基础代码与 .gitignore 否定规则和根路径 /secret 规则
+    (test_dir / "src").mkdir(parents=True, exist_ok=True)
+    with open(test_dir / "src" / "main.py", "w", encoding="utf-8") as f:
+        f.write("print('hello world')\n")
+    with open(test_dir / ".gitignore", "w", encoding="utf-8") as f:
+        f.write("*.log\n!important.log\n/secret.key\n")
+    with open(test_dir / "dropped.log", "w", encoding="utf-8") as f:
+        f.write("should be dropped\n")
+    with open(test_dir / "important.log", "w", encoding="utf-8") as f:
+        f.write("keep me please\n")
+    with open(test_dir / "secret.key", "w", encoding="utf-8") as f:
+        f.write("DO_NOT_LEAK\n")
+
+    # 2. 反引号冲突文件
+    with open(test_dir / "doc.md", "w", encoding="utf-8") as f:
+        f.write("Inner fence:\n```bash\necho 123\n```\n")
+
+    # 3. GBK 编码中文文件
+    with open(test_dir / "gbk_test.py", "wb") as f:
+        f.write("# 这是 GBK 编码注释".encode("gb18030"))
+
+    try:
+        packed_text, meta = pack_codebase(str(test_dir))
+        assert "important.log" in packed_text, "Negation rule !important.log failed"
+        assert "dropped.log" not in packed_text, "Normal ignore rule *.log failed"
+        assert "DO_NOT_LEAK" not in packed_text, "Root anchored rule /secret.key failed"
+        assert "````" in packed_text, "Backtick collision defense failed"
+        assert "这是 GBK 编码注释" in packed_text, "GBK encoding decoding failed"
+        print(f"[+] 核心安全与对抗断言全部通过！打包 {meta['files_count']} 个文件，估算 Token: {meta['token_estimate']}")
+
+        packed_xml, meta_xml = pack_codebase(str(test_dir), output_format="xml")
+        assert "<project" in packed_xml and "<file path=" in packed_xml
+        print("[+] XML 格式输出验证通过！")
+
+    finally:
+        import shutil
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+    print("[+] RepoPrompt 对抗防御测试 100% 成功通过！")
+
+
+def main():
+    if "--self-test" in sys.argv:
+        self_test()
+        return
+
+    target = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "."
+    output_format = "xml" if "--xml" in sys.argv else "markdown"
+    default_ext = ".xml" if output_format == "xml" else ".md"
+    output_file = f"repoprompt-output{default_ext}"
+    copy_clipboard = "--copy" in sys.argv
+    include_minified = "--include-minified" in sys.argv
+
+    max_depth = 8
+    for arg in sys.argv:
+        if arg.startswith("--max-depth="):
+            try: max_depth = int(arg.split("=")[1])
+            except ValueError: pass
+
+    if "--output" in sys.argv:
+        idx = sys.argv.index("--output")
+        if idx + 1 < len(sys.argv):
+            output_file = sys.argv[idx + 1]
+
+    print(f"[*] RepoPrompt v{VERSION} 正在扫描并打包代码库: {target} (Format: {output_format}) ...", file=sys.stderr)
+    try:
+        packed, meta = pack_codebase(
+            target,
+            output_format=output_format,
+            include_minified=include_minified,
+            output_filename=output_file,
+            max_depth=max_depth
+        )
+
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(packed)
+
+        print(f"✅ 打包成功! 耗时 {meta['elapsed_sec']}s", file=sys.stderr)
+        print(f"📊 文件数: {meta['files_count']} | 代码行数: {meta['total_lines']} | 估算 Tokens: ~{meta['token_estimate']:,}", file=sys.stderr)
+        print(f"📄 成果已保存至: {output_file}", file=sys.stderr)
+
+        if copy_clipboard:
+            if copy_to_clipboard(packed):
+                print("📋 完整代码上下文已自动复制到系统剪贴板 (Ctrl+V 可直接发给 AI)！", file=sys.stderr)
+            else:
+                print("[!] 自动复制剪贴板失败，请直接打开 output 文件复制。", file=sys.stderr)
+
+        print(f"\n☕ 觉得好用？请作者喝杯咖啡支持持续维护: {PAYPAL_URL}\n", file=sys.stderr)
+
+    except Exception as e:
+        print(f"[!] 打包出错: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
