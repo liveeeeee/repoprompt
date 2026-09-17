@@ -16,16 +16,20 @@ from pathlib import Path
 from typing import List, Set, Tuple, Optional, Dict, Any
 
 
+from xml.sax.saxutils import escape, quoteattr
+
 PAYPAL_URL = "https://paypal.me/liveeeeee1203"
 VERSION = "1.2.0"
 
-# 默认全局忽略的目录与文件（内置防自吞噬规则）
-DEFAULT_IGNORE_PATTERNS = [
+# 构建产物目录（可通过 --keep-build-dirs 豁免）
+BUILD_DIRS = ["dist", "build", "out", "target", "bin", "obj"]
+
+# 基础默认全局忽略的目录与文件（内置防自吞噬规则）
+BASE_IGNORE_PATTERNS = [
     ".git", ".svn", ".hg",
     "node_modules", "bower_components",
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".venv", "venv", "env", ".env", ".env.*",
-    "dist", "build", "out", "target", "bin", "obj",
     ".idea", ".vscode", ".DS_Store", "Thumbs.db",
     "repomix-output.*", "pyrepomix-output.*", "repoprompt-output.*",
     "*.pyc", "*.pyo", "*.pyd", "*.so", "*.dll", "*.dylib", "*.exe",
@@ -35,6 +39,7 @@ DEFAULT_IGNORE_PATTERNS = [
     "*.pdf", "*.docx", "*.xlsx", "*.pptx",
     "*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock"
 ]
+DEFAULT_IGNORE_PATTERNS = BASE_IGNORE_PATTERNS + BUILD_DIRS
 
 # 常见纯文本与代码文件扩展名
 TEXT_EXTENSIONS = {
@@ -54,20 +59,21 @@ class GitIgnoreEngine:
     轻量且贴合 Git 规范的 GitIgnore 引擎。
     支持：
     1. 根目录与子目录 .gitignore 嵌套继承
-    2. /pattern 根路径锚定匹配
+    2. /pattern 根路径锚定匹配（仅匹配本 .gitignore 所在目录对应层级）
     3. !pattern 否定反选规则
     4. pattern/ 目录限定匹配
     """
 
-    def __init__(self, root_dir: Path, extra_ignores: Optional[List[str]] = None):
+    def __init__(self, root_dir: Path, extra_ignores: Optional[List[str]] = None, keep_build_dirs: bool = False):
         self.root_dir = root_dir.resolve()
-        self.rules: List[Tuple[Path, bool, str, bool]] = []
-        self._init_default_rules(extra_ignores or [])
+        self.rules: List[Tuple[Path, bool, str, bool, bool]] = []
+        self._init_default_rules(extra_ignores or [], keep_build_dirs=keep_build_dirs)
         self._collect_all_gitignores()
 
-    def _init_default_rules(self, extra_ignores: List[str]):
-        for pat in DEFAULT_IGNORE_PATTERNS + extra_ignores:
-            self.rules.append((self.root_dir, False, pat, False))
+    def _init_default_rules(self, extra_ignores: List[str], keep_build_dirs: bool = False):
+        ignore_patterns = BASE_IGNORE_PATTERNS if keep_build_dirs else DEFAULT_IGNORE_PATTERNS
+        for pat in ignore_patterns + extra_ignores:
+            self.rules.append((self.root_dir, False, pat, False, False))
 
     def _collect_all_gitignores(self):
         for curr_root, dirs, files in os.walk(self.root_dir, followlinks=False):
@@ -97,7 +103,7 @@ class GitIgnoreEngine:
                         clean_pat = clean_pat.lstrip("/")
 
                     if clean_pat:
-                        self.rules.append((scope_dir, is_neg, clean_pat, is_dir_only))
+                        self.rules.append((scope_dir, is_neg, clean_pat, is_dir_only, is_rooted))
         except Exception:
             pass
 
@@ -109,24 +115,32 @@ class GitIgnoreEngine:
             return False
 
         ignored = False
-        for scope_dir, is_neg, pat, is_dir_only in self.rules:
+        for scope_dir, is_neg, pat, is_dir_only, is_rooted in self.rules:
             if is_dir_only and not is_dir:
                 continue
 
-            # 确定匹配路径的作用域
+            # 确定匹配路径相对于当前规则作用域 scope_dir 的相对路径
             try:
                 rel_to_scope = resolved_path.relative_to(scope_dir).as_posix()
             except ValueError:
                 continue
 
             matched = False
-            # 模式包含斜杠时按完整相对路径匹配，否则支持文件名匹配
-            if "/" in pat:
-                if fnmatch.fnmatch(rel_to_scope, pat) or fnmatch.fnmatch(rel_to_scope, f"*/{pat}"):
-                    matched = True
+            if is_rooted:
+                # 根锚定规则：只匹配该 .gitignore 所在目录的直接层级或指定相对路径
+                if "/" in pat:
+                    matched = fnmatch.fnmatch(rel_to_scope, pat)
+                else:
+                    # 模式不含 /，只匹配直接同级文件/目录，不允许跨越深层子目录
+                    matched = ("/" not in rel_to_scope) and fnmatch.fnmatch(rel_to_scope, pat)
             else:
-                if fnmatch.fnmatch(path.name, pat) or fnmatch.fnmatch(rel_to_scope, pat):
-                    matched = True
+                # 非锚定规则：保持递归匹配
+                if "/" in pat:
+                    if fnmatch.fnmatch(rel_to_scope, pat) or fnmatch.fnmatch(rel_to_scope, f"*/{pat}"):
+                        matched = True
+                else:
+                    if fnmatch.fnmatch(path.name, pat) or fnmatch.fnmatch(rel_to_scope, pat):
+                        matched = True
 
             if matched:
                 ignored = not is_neg
@@ -291,7 +305,8 @@ def pack_codebase(
     include_minified: bool = False,
     output_filename: Optional[str] = None,
     max_file_size: int = 10 * 1024 * 1024,
-    max_depth: int = 8
+    max_depth: int = 8,
+    keep_build_dirs: bool = False
 ) -> Tuple[str, Dict[str, Any]]:
     """核心打包函数，支持 Markdown 与 XML 格式"""
     start_time = time.time()
@@ -304,9 +319,11 @@ def pack_codebase(
     if output_filename:
         extra_ignores.append(Path(output_filename).name)
 
-    gitignore = GitIgnoreEngine(root_path, extra_ignores=extra_ignores)
+    gitignore = GitIgnoreEngine(root_path, extra_ignores=extra_ignores, keep_build_dirs=keep_build_dirs)
 
     valid_files: List[Path] = []
+    warned_build_dirs: Set[str] = set()
+
     for root, dirs, files in os.walk(root_path, followlinks=False):
         d_path = Path(root)
         try:
@@ -316,6 +333,15 @@ def pack_codebase(
                 continue
         except ValueError:
             pass
+
+        # 检查是否命中了默认构建目录并向 stderr 友好提醒
+        if not keep_build_dirs:
+            for d in list(dirs):
+                if d.lower() in BUILD_DIRS and gitignore.is_ignored(d_path / d, is_dir=True):
+                    rel_d = (d_path / d).relative_to(root_path).as_posix()
+                    if rel_d not in warned_build_dirs:
+                        warned_build_dirs.add(rel_d)
+                        sys.stderr.write(f"[RepoPrompt] 提示: 默认忽略构建目录 '{rel_d}' (如需包含源码请使用 --keep-build-dirs)\n")
 
         # 实时根据 .gitignore 剪枝跳过不扫描的文件夹
         dirs[:] = [d for d in dirs if not gitignore.is_ignored(d_path / d, is_dir=True)]
@@ -355,17 +381,20 @@ def pack_codebase(
         total_lines += line_count
 
         if output_format == "xml":
+            path_attr = quoteattr(rel_path)
+            content_escaped = escape(content.rstrip())
             block = (
-                f'<file path="{rel_path}">\n'
-                f"{content.rstrip()}\n"
+                f"<file path={path_attr}>\n"
+                f"{content_escaped}\n"
                 f"</file>"
             )
         else:
             fence = get_adaptive_backticks(content)
             ext = file_path.suffix.lstrip(".")
             lang_id = ext if ext else ""
+            safe_rel_path = rel_path.replace("`", r"\`")
             block = (
-                f"### File: `{rel_path}`\n"
+                f"### File: `{safe_rel_path}`\n"
                 f"{fence}{lang_id}\n"
                 f"{content.rstrip()}\n"
                 f"{fence}\n"
@@ -373,10 +402,12 @@ def pack_codebase(
         file_blocks.append(block)
 
     if output_format == "xml":
+        root_name_attr = quoteattr(root_path.name)
+        tree_escaped = escape(tree_str)
         final_output = (
-            f'<project name="{root_path.name}">\n'
+            f"<project name={root_name_attr}>\n"
             f"  <generated_by>RepoPrompt v{VERSION} - Zero-Dependency Codebase Packager</generated_by>\n"
-            f"  <directory_structure>\n{tree_str}\n  </directory_structure>\n"
+            f"  <directory_structure>\n{tree_escaped}\n  </directory_structure>\n"
             f"  <files>\n" + "\n".join(file_blocks) + "\n  </files>\n"
             f"</project>\n"
         )
@@ -407,12 +438,13 @@ def self_test():
     """自动化离线自检，包含全部红蓝对抗防御断言"""
     print("[*] 正在执行 RepoPrompt 对抗防御自检...")
     import tempfile
+    import xml.etree.ElementTree as ET
     test_dir = Path(tempfile.mkdtemp(prefix="repoprompt_test_"))
 
-    # 1. 基础代码与 .gitignore 否定规则和根路径 /secret 规则
-    (test_dir / "src").mkdir(parents=True, exist_ok=True)
+    # 1. 基础代码与 .gitignore 否定规则和根路径 /secret.key 锚定规则
+    (test_dir / "src" / "deep").mkdir(parents=True, exist_ok=True)
     with open(test_dir / "src" / "main.py", "w", encoding="utf-8") as f:
-        f.write("print('hello world')\n")
+        f.write("if x < 5 and y > 2 & z: print('valid xml escaping')\n")
     with open(test_dir / ".gitignore", "w", encoding="utf-8") as f:
         f.write("*.log\n!important.log\n/secret.key\n")
     with open(test_dir / "dropped.log", "w", encoding="utf-8") as f:
@@ -420,9 +452,13 @@ def self_test():
     with open(test_dir / "important.log", "w", encoding="utf-8") as f:
         f.write("keep me please\n")
     with open(test_dir / "secret.key", "w", encoding="utf-8") as f:
-        f.write("DO_NOT_LEAK\n")
+        f.write("ROOT_SECRET_DO_NOT_LEAK\n")
+    with open(test_dir / "src" / "deep" / "secret.key", "w", encoding="utf-8") as f:
+        f.write("DEEP_SECRET_SHOULD_BE_KEPT\n")
 
-    # 2. 反引号冲突文件
+    # 2. 反引号文件名与冲突文件
+    with open(test_dir / "weird`name.py", "w", encoding="utf-8") as f:
+        f.write("print('weird')\n")
     with open(test_dir / "doc.md", "w", encoding="utf-8") as f:
         f.write("Inner fence:\n```bash\necho 123\n```\n")
 
@@ -430,18 +466,35 @@ def self_test():
     with open(test_dir / "gbk_test.py", "wb") as f:
         f.write("# 这是 GBK 编码注释".encode("gb18030"))
 
+    # 4. 构建目录
+    (test_dir / "build").mkdir(exist_ok=True)
+    with open(test_dir / "build" / "template.html", "w", encoding="utf-8") as f:
+        f.write("<div>template</div>\n")
+
     try:
         packed_text, meta = pack_codebase(str(test_dir))
         assert "important.log" in packed_text, "Negation rule !important.log failed"
         assert "dropped.log" not in packed_text, "Normal ignore rule *.log failed"
-        assert "DO_NOT_LEAK" not in packed_text, "Root anchored rule /secret.key failed"
+        assert "ROOT_SECRET_DO_NOT_LEAK" not in packed_text, "Root anchored rule /secret.key failed"
+        assert "DEEP_SECRET_SHOULD_BE_KEPT" in packed_text, "Deep secret.key should be kept by root anchor"
+        assert "weird\\`name.py" in packed_text, "Filename backtick escaping failed"
+        assert "template.html" not in packed_text, "Default build dir ignore failed"
         assert "````" in packed_text, "Backtick collision defense failed"
         assert "这是 GBK 编码注释" in packed_text, "GBK encoding decoding failed"
         print(f"[+] 核心安全与对抗断言全部通过！打包 {meta['files_count']} 个文件，估算 Token: {meta['token_estimate']}")
 
+        # 验证 --keep-build-dirs
+        packed_kept, _ = pack_codebase(str(test_dir), keep_build_dirs=True)
+        assert "template.html" in packed_kept, "--keep-build-dirs failed to retain build/ files"
+        print("[+] --keep-build-dirs 构建目录豁免验证通过！")
+
+        # 验证 XML 格式并由标准 ElementTree 解析
         packed_xml, meta_xml = pack_codebase(str(test_dir), output_format="xml")
-        assert "<project" in packed_xml and "<file path=" in packed_xml
-        print("[+] XML 格式输出验证通过！")
+        xml_root = ET.fromstring(packed_xml)
+        assert xml_root.tag == "project"
+        files_elem = xml_root.find("files")
+        assert files_elem is not None and len(files_elem) > 0
+        print("[+] XML 格式输出与 ElementTree 无损解析验证通过！")
 
     finally:
         import shutil
@@ -461,6 +514,7 @@ def main():
     output_file = f"repoprompt-output{default_ext}"
     copy_clipboard = "--copy" in sys.argv
     include_minified = "--include-minified" in sys.argv
+    keep_build_dirs = "--keep-build-dirs" in sys.argv
 
     max_depth = 8
     for arg in sys.argv:
@@ -480,7 +534,8 @@ def main():
             output_format=output_format,
             include_minified=include_minified,
             output_filename=output_file,
-            max_depth=max_depth
+            max_depth=max_depth,
+            keep_build_dirs=keep_build_dirs
         )
 
         with open(output_file, "w", encoding="utf-8") as f:

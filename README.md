@@ -21,7 +21,7 @@ When feeding an entire codebase to LLMs (ChatGPT, Claude, DeepSeek, Cursor), pop
 **RepoPrompt solves this once and for all:**
 - ✅ **0 Third-Party Dependencies (零依赖)**: Built 100% on the Python Standard Library.
 - ✅ **Single File, Drop & Run (单文件即用)**: Copy `repoprompt.py` anywhere and run immediately.
-- ✅ **Lightning Fast (毫秒级启动)**: Executes in ~0.02s without runtime boot overhead.
+- ✅ **Lightning Fast (毫秒级执行)**: Executes in ~0.02s (in-process packing) / ~0.31s (CLI end-to-end with Python runtime boot).
 - ✅ **AI & LLM Optimized (大模型专属优化)**: Adaptive backticks, XML & Markdown dual output, and native `--copy` clipboard support.
 
 ---
@@ -32,11 +32,11 @@ When feeding an entire codebase to LLMs (ChatGPT, Claude, DeepSeek, Cursor), pop
 | :--- | :---: | :---: | :---: |
 | **Dependencies (依赖)** | **0 (Pure Standard Library)** | Node.js + npm packages | FastAPI + Uvicorn + Web |
 | **Installation (安装门槛)** | **1 file or `pip install`** | `npm install -g repomix` | `pip install gitingest` |
-| **Startup Speed (启动速度)** | **~0.02s (Instant)** | ~1.5s | ~0.8s |
-| **.gitignore Support** | ✅ Full recursive + negation (`!`) | ✅ Yes | ⚠️ Partial |
+| **Startup Speed (启动速度)** | **~0.02s (in-process) / ~0.31s (CLI)** | ~1.5s (CLI) | ~0.8s (Web) |
+| **.gitignore Support** | ✅ Full recursive + negation (`!`) + root anchors | ✅ Yes | ⚠️ Partial |
 | **Markdown Collision Safety** | ✅ Adaptive dynamic backticks | ⚠️ Basic | ⚠️ Basic |
 | **Clipboard One-Click** | ✅ Cross-platform (`--copy`) | ✅ Yes | ❌ Browser only |
-| **XML Output for Claude** | ✅ Native (`--xml`) | ✅ Yes | ❌ No |
+| **XML Output for Claude** | ✅ Native lossless (`--xml` with saxutils) | ✅ Yes | ❌ No |
 
 ---
 
@@ -97,6 +97,7 @@ Options:
   --output <FILE>        Custom output destination filename
   --copy                 Automatically copy the packed output to system clipboard
   --include-minified     Include minified JS/CSS files (excluded by default)
+  --keep-build-dirs      Retain build directories (bin, build, dist, out, target)
   --max-depth=<INT>      Maximum folder recursion depth (default: 8)
   --self-test            Run built-in offline security and adversarial test suite
 ```
