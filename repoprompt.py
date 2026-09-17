@@ -162,10 +162,17 @@ class GitIgnoreEngine:
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     line = line.strip()
-                    if not line or line.startswith("#"):
+                    if not line:
                         continue
+                    if line.startswith(r"\#"):
+                        line = line[1:]
+                    elif line.startswith("#"):
+                        continue
+
                     is_neg = False
-                    if line.startswith("!"):
+                    if line.startswith(r"\!"):
+                        line = line[1:]
+                    elif line.startswith("!"):
                         is_neg = True
                         line = line[1:].strip()
 
@@ -322,8 +329,14 @@ def sanitize_for_xml(text: str) -> str:
 
 
 
-def build_directory_tree(root_dir: Path, gitignore: GitIgnoreEngine, max_depth: int = 6, include_minified: bool = False) -> str:
-    """生成整洁清晰的 ASCII 目录树，智能剔除忽略文件、二进制与混淆文件"""
+def build_directory_tree(
+    root_dir: Path,
+    gitignore: GitIgnoreEngine,
+    max_depth: int = 6,
+    include_minified: bool = False,
+    max_file_size: int = 10 * 1024 * 1024
+) -> str:
+    """生成整洁清晰的 ASCII 目录树，智能剔除忽略文件、超大文件、二进制与混淆文件"""
     tree_lines = [f"{root_dir.name}/"]
 
     def _walk(directory: Path, prefix: str, depth: int):
@@ -335,13 +348,20 @@ def build_directory_tree(root_dir: Path, gitignore: GitIgnoreEngine, max_depth: 
             items = []
             for item in directory.iterdir():
                 try:
-                    if item.is_symlink() and not item.exists():
-                        continue
+                    # 跳过断链或指向目录的符号链接，防止死循环
+                    if item.is_symlink():
+                        if not item.exists() or item.is_dir():
+                            continue
                     is_d = item.is_dir()
                     if gitignore.is_ignored(item, is_dir=is_d):
                         continue
                     if not is_d:
                         if is_binary_file(item):
+                            continue
+                        try:
+                            if item.stat().st_size > max_file_size:
+                                continue
+                        except OSError:
                             continue
                         if not include_minified and is_minified_file(item):
                             continue
@@ -474,7 +494,13 @@ def pack_codebase(
 
     valid_files.sort(key=lambda x: x.as_posix().lower())
 
-    tree_str = build_directory_tree(root_path, gitignore, max_depth=max_depth, include_minified=include_minified)
+    tree_str = build_directory_tree(
+        root_path,
+        gitignore,
+        max_depth=max_depth,
+        include_minified=include_minified,
+        max_file_size=max_file_size
+    )
 
     total_lines = 0
     file_blocks = []
@@ -632,24 +658,50 @@ def main():
         self_test()
         return
 
-    target = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "."
-    output_format = "xml" if "--xml" in sys.argv else "markdown"
-    default_ext = ".xml" if output_format == "xml" else ".md"
-    output_file = f"repoprompt-output{default_ext}"
-    copy_clipboard = "--copy" in sys.argv
-    include_minified = "--include-minified" in sys.argv
-    keep_build_dirs = "--keep-build-dirs" in sys.argv
-
+    output_format = "markdown"
+    output_file = None
+    copy_clipboard = False
+    include_minified = False
+    keep_build_dirs = False
     max_depth = 8
-    for arg in sys.argv:
-        if arg.startswith("--max-depth="):
-            try: max_depth = int(arg.split("=")[1])
-            except ValueError: pass
+    target = "."
 
-    if "--output" in sys.argv:
-        idx = sys.argv.index("--output")
-        if idx + 1 < len(sys.argv):
-            output_file = sys.argv[idx + 1]
+    args = sys.argv[1:]
+    non_flag_args = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--xml":
+            output_format = "xml"
+        elif arg == "--markdown":
+            output_format = "markdown"
+        elif arg == "--copy":
+            copy_clipboard = True
+        elif arg == "--include-minified":
+            include_minified = True
+        elif arg == "--keep-build-dirs":
+            keep_build_dirs = True
+        elif arg.startswith("--max-depth="):
+            try: max_depth = int(arg.split("=", 1)[1])
+            except ValueError: pass
+        elif arg.startswith("--output="):
+            output_file = arg.split("=", 1)[1]
+        elif arg in ("--output", "-o"):
+            if i + 1 < len(args):
+                output_file = args[i + 1]
+                i += 1
+        elif arg.startswith("-o="):
+            output_file = arg.split("=", 1)[1]
+        elif not arg.startswith("-"):
+            non_flag_args.append(arg)
+        i += 1
+
+    if non_flag_args:
+        target = non_flag_args[0]
+
+    default_ext = ".xml" if output_format == "xml" else ".md"
+    if not output_file:
+        output_file = f"repoprompt-output{default_ext}"
 
     print(f"[*] RepoPrompt v{VERSION} 正在扫描并打包代码库: {target} (Format: {output_format}) ...", file=sys.stderr)
     try:
