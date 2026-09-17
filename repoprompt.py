@@ -117,6 +117,18 @@ def _pattern_to_regex(pat: str, is_rooted: bool) -> Any:
     return re.compile(regex_str)
 
 
+class IgnoreRule:
+    """封装 .gitignore 规则的数据结构，使用 __slots__ 优化高频匹配性能与内存"""
+    __slots__ = ("scope_dir", "is_neg", "is_dir_only", "source", "regex")
+
+    def __init__(self, scope_dir: Path, is_neg: bool, is_dir_only: bool, source: str, regex: Any):
+        self.scope_dir = scope_dir
+        self.is_neg = is_neg
+        self.is_dir_only = is_dir_only
+        self.source = source
+        self.regex = regex
+
+
 class GitIgnoreEngine:
     """
     轻量且贴合 Git 规范的 GitIgnore 引擎。
@@ -131,14 +143,13 @@ class GitIgnoreEngine:
 
     def __init__(self, root_dir: Path, extra_ignores: Optional[List[str]] = None, keep_build_dirs: bool = False):
         self.root_dir = root_dir.resolve()
-        # rule: (scope_dir, is_neg, clean_pat, is_dir_only, is_rooted, source, regex)
-        self.rules: List[Tuple[Path, bool, str, bool, bool, str, Any]] = []
+        self.rules: List[IgnoreRule] = []
         self._init_default_rules(extra_ignores or [], keep_build_dirs=keep_build_dirs)
         self._collect_all_gitignores()
 
     def _add_rule(self, scope_dir: Path, is_neg: bool, pat: str, is_dir_only: bool, is_rooted: bool, source: str):
         rx = _pattern_to_regex(pat, is_rooted=is_rooted)
-        self.rules.append((scope_dir, is_neg, pat, is_dir_only, is_rooted, source, rx))
+        self.rules.append(IgnoreRule(scope_dir, is_neg, is_dir_only, source, rx))
 
     def _init_default_rules(self, extra_ignores: List[str], keep_build_dirs: bool = False):
         for pat in BASE_IGNORE_PATTERNS:
@@ -198,25 +209,29 @@ class GitIgnoreEngine:
 
         ignored = False
         last_matched_source = None
+        root_dir = self.root_dir
 
-        for scope_dir, is_neg, pat, is_dir_only, is_rooted, source, rx in self.rules:
-            if ignore_source and source == ignore_source:
+        for rule in self.rules:
+            if ignore_source and rule.source == ignore_source:
                 continue
-            if is_dir_only and not is_dir:
-                continue
-
-            try:
-                rel_to_scope = resolved_path.relative_to(scope_dir).as_posix()
-            except ValueError:
+            if rule.is_dir_only and not is_dir:
                 continue
 
-            if rx.match(rel_to_scope):
-                if is_neg:
+            if rule.scope_dir == root_dir:
+                rel_to_scope = rel_to_root
+            else:
+                try:
+                    rel_to_scope = resolved_path.relative_to(rule.scope_dir).as_posix()
+                except ValueError:
+                    continue
+
+            if rule.regex.match(rel_to_scope):
+                if rule.is_neg:
                     ignored = False
                     last_matched_source = None
                 else:
                     ignored = True
-                    last_matched_source = source
+                    last_matched_source = rule.source
 
         return ignored, last_matched_source
 
@@ -233,9 +248,9 @@ class GitIgnoreEngine:
 
 
 def is_binary_file(file_path: Path) -> bool:
-    """通过读取首部 1024 字节嗅探是否包含 null 字节来判定是否二进制文件"""
+    """通过扩展名与首部 1024 字节嗅探判定是否二进制文件"""
     ext = file_path.suffix.lower()
-    if ext in TEXT_EXTENSIONS:
+    if ext in TEXT_EXTENSIONS or file_path.name in TEXT_EXTENSIONS:
         return False
     try:
         with open(file_path, "rb") as f:
@@ -654,8 +669,42 @@ def self_test():
 
 
 def main():
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print("RepoPrompt - Zero-Dependency Codebase Packager for LLMs")
+        print(f"Version: {VERSION} | Author: liveeeeee | Donate: {PAYPAL_URL}\n")
+        print("Usage:")
+        print("  repoprompt [PATH] [OPTIONS]\n")
+        print("Options:")
+        print("  -o, --output FILE       Save output to specified file (e.g. -o repo.md)")
+        print("  --xml                   Output in XML format for Claude (default: Markdown)")
+        print("  --markdown              Output in Markdown format")
+        print("  --copy                  Copy output to clipboard automatically")
+        print("  --include-minified      Include minified code files")
+        print("  --keep-build-dirs       Keep build output directories (dist/, build/, etc.)")
+        print("  --max-depth=N           Maximum directory scan depth (default: 8)")
+        print("  --self-test             Run offline defensive self-test suite")
+        print("  -h, --help              Show this help message and exit")
+        return
+
     if "--self-test" in sys.argv:
         self_test()
+        return
+
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(f"RepoPrompt v{VERSION} - Zero-Dependency Codebase Packager for LLMs")
+        print(f"Author: liveeeeee | Donate: {PAYPAL_URL}\n")
+        print("Usage:")
+        print("  repoprompt [DIRECTORY] [OPTIONS]\n")
+        print("Options:")
+        print("  -o, --output FILE       Output file path (default: repoprompt-output.md/.xml)")
+        print("  --xml                   Output in XML format instead of Markdown")
+        print("  --markdown              Output in Markdown format (default)")
+        print("  --copy                  Copy packaged output directly to system clipboard")
+        print("  --include-minified      Include minified JS/CSS files normally skipped")
+        print("  --keep-build-dirs       Include build artifact directories (dist, build, etc.)")
+        print("  --max-depth=N           Maximum directory recursion depth (default: 8)")
+        print("  --self-test             Run self-test diagnostic assertions")
+        print("  -h, --help              Show this help message and exit")
         return
 
     output_format = "markdown"
